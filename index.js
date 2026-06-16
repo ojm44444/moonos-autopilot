@@ -15,34 +15,37 @@ const SLACK_BOT_TOKEN = process.env.SLACK_BOT_TOKEN;
 const GITHUB_TOKEN = process.env.GITHUB_TOKEN;
 const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY;
 const OWNER = "ojm44444";
-const REPO = "moon-dashboard";
-const ERROR_CHANNEL_NAME = "moon-os-support";
+
+const CHANNELS = {
+  "moon-os-support": { repo: "moon-dashboard", mode: "fix" },
+  "moon-os-build":   { repo: "moon-dashboard", mode: "build" },
+  "memo-build":      { repo: "memo",            mode: "build" },
+};
 
 const slack = new WebClient(SLACK_BOT_TOKEN);
 const octokit = new Octokit({ auth: GITHUB_TOKEN });
 const anthropic = new Anthropic({ apiKey: ANTHROPIC_API_KEY });
 
-let errorChannelId = null;
-let lastTriageTs = null; // timestamp of last triage run
+let channelMap = {}; // name -> { id, repo, mode }
+let lastTriageTs = null;
 
-async function resolveChannelId() {
-  const result = await slack.conversations.list({ limit: 200 });
-  const channel = result.channels.find(c => c.name === ERROR_CHANNEL_NAME);
-  if (channel) {
-    errorChannelId = channel.id;
-    console.log(`✅ Error channel found: #${ERROR_CHANNEL_NAME} (${errorChannelId})`);
-  } else {
-    console.warn(`⚠️ Could not find channel #${ERROR_CHANNEL_NAME}`);
+async function resolveChannelIds() {
+  const result = await slack.conversations.list({ limit: 200, types: "public_channel,private_channel" });
+  for (const channel of result.channels) {
+    if (CHANNELS[channel.name]) {
+      channelMap[channel.id] = { name: channel.name, ...CHANNELS[channel.name] };
+      console.log(`✅ Channel #${channel.name} (${channel.id}) → repo: ${CHANNELS[channel.name].repo}, mode: ${CHANNELS[channel.name].mode}`);
+    }
   }
 }
 
-async function getRepoFiles() {
+async function getRepoFiles(repo = "moon-dashboard") {
   const ignore = ["node_modules", ".git", ".next", "dist", "build"];
   const extensions = [".js", ".jsx", ".ts", ".tsx", ".css", ".json", ".md"];
   const files = [];
 
   async function listDir(dirPath) {
-    const { data } = await octokit.repos.getContent({ owner: OWNER, repo: REPO, path: dirPath });
+    const { data } = await octokit.repos.getContent({ owner: OWNER, repo, path: dirPath });
     for (const item of data) {
       if (ignore.some(ig => item.name === ig)) continue;
       if (item.type === "dir") {
@@ -57,30 +60,30 @@ async function getRepoFiles() {
   return files.slice(0, 25);
 }
 
-async function getFileContent(filePath) {
+async function getFileContent(filePath, repo = "moon-dashboard") {
   try {
-    const { data } = await octokit.repos.getContent({ owner: OWNER, repo: REPO, path: filePath });
+    const { data } = await octokit.repos.getContent({ owner: OWNER, repo, path: filePath });
     return Buffer.from(data.content, "base64").toString("utf8").slice(0, 2000);
   } catch (_) {
     return "";
   }
 }
 
-async function runClaudeAndPR(taskDescription, channel, label) {
+async function runClaudeAndPR(taskDescription, channel, label, repo = "moon-dashboard") {
   const branch = `ai-${Date.now()}`;
 
   // Get main branch SHA
-  const { data: refData } = await octokit.git.getRef({ owner: OWNER, repo: REPO, ref: "heads/main" });
+  const { data: refData } = await octokit.git.getRef({ owner: OWNER, repo, ref: "heads/main" });
   const mainSha = refData.object.sha;
 
   // Create new branch
-  await octokit.git.createRef({ owner: OWNER, repo: REPO, ref: `refs/heads/${branch}`, sha: mainSha });
+  await octokit.git.createRef({ owner: OWNER, repo, ref: `refs/heads/${branch}`, sha: mainSha });
 
   // Get repo context
-  const filePaths = await getRepoFiles();
+  const filePaths = await getRepoFiles(repo);
   let repoContext = "";
   for (const fp of filePaths) {
-    const content = await getFileContent(fp);
+    const content = await getFileContent(fp, repo);
     if (content) repoContext += `\n\n--- ${fp} ---\n${content}`;
   }
 
@@ -90,7 +93,7 @@ async function runClaudeAndPR(taskDescription, channel, label) {
     max_tokens: 4096,
     messages: [{
       role: "user",
-      content: `You are working on the moon-dashboard Next.js app. Here are the current files:\n${repoContext}\n\nTask: ${taskDescription}\n\nRespond with ONLY the files to create or modify. For each file use this exact format:\n\n<file path="relative/path/to/file.tsx">\nfile contents here\n</file>\n\nDo not explain, just output the file blocks.`
+      content: `You are working on the ${repo} app. Here are the current files:\n${repoContext}\n\nTask: ${taskDescription}\n\nRespond with ONLY the files to create or modify. For each file use this exact format:\n\n<file path="relative/path/to/file.tsx">\nfile contents here\n</file>\n\nDo not explain, just output the file blocks.`
     }]
   });
 
@@ -110,23 +113,23 @@ async function runClaudeAndPR(taskDescription, channel, label) {
     // Check if file exists (to get SHA for update)
     let fileSha;
     try {
-      const { data } = await octokit.repos.getContent({ owner: OWNER, repo: REPO, path: filePath, ref: branch });
+      const { data } = await octokit.repos.getContent({ owner: OWNER, repo, path: filePath, ref: branch });
       fileSha = data.sha;
     } catch (_) {}
 
     await octokit.repos.createOrUpdateFileContents({
-      owner: OWNER, repo: REPO,
+      owner: OWNER, repo,
       path: filePath,
       message: `AI: ${label.substring(0, 60)}`,
       content: encoded,
       branch,
       ...(fileSha ? { sha: fileSha } : {}),
     });
-    console.log(`✅ Committed ${filePath}`);
+    console.log(`✅ Committed ${filePath} to ${repo}`);
   }
 
   const pr = await octokit.pulls.create({
-    owner: OWNER, repo: REPO,
+    owner: OWNER, repo,
     title: `AI: ${label.substring(0, 60)}`,
     head: branch, base: "main",
     body: `Automated change from Slack.\n\nTask:\n> ${label}`,
@@ -134,7 +137,7 @@ async function runClaudeAndPR(taskDescription, channel, label) {
 
   // Auto-merge the PR
   await octokit.pulls.merge({
-    owner: OWNER, repo: REPO,
+    owner: OWNER, repo,
     pull_number: pr.data.number,
     merge_method: "squash",
   });
@@ -206,48 +209,53 @@ app.post("/slack/events", async (req, res) => {
   const event = req.body.event;
   if (!event || !event.text || event.bot_id) return res.sendStatus(200);
 
-  const isErrorChannel = event.channel === errorChannelId;
+  const ch = channelMap[event.channel];
+  if (!ch) return res.sendStatus(200); // not a channel we care about
+
   const text = event.text;
   const textLower = text.toLowerCase();
-
   const isMentioned = text.includes("<@U0BB2LN6AKB>");
-  const isTriageCommand = textLower.trim() === "triage";
-  const isTaskCommand = textLower.startsWith("build") || textLower.startsWith("fix") || textLower.startsWith("add") || textLower.startsWith("create");
 
-  if (isErrorChannel && isTriageCommand) {
-    console.log("Triage requested");
-    res.sendStatus(200);
-    try {
-      await triageErrors(event.channel);
-    } catch (err) {
-      console.error(err);
-      await slack.chat.postMessage({ channel: event.channel, text: `❌ Triage failed: ${err.message}` });
+  // Fix channel: triage command or task keywords/mentions
+  if (ch.mode === "fix") {
+    const isTriageCommand = textLower.trim() === "triage";
+    const isTaskCommand = isMentioned ||
+      textLower.startsWith("build") || textLower.startsWith("fix") ||
+      textLower.startsWith("add") || textLower.startsWith("create");
+
+    if (isTriageCommand) {
+      console.log("Triage requested");
+      res.sendStatus(200);
+      try {
+        await triageErrors(event.channel);
+      } catch (err) {
+        console.error(err);
+        await slack.chat.postMessage({ channel: event.channel, text: `❌ Triage failed: ${err.message}` });
+      }
+      return;
     }
-    return;
+
+    if (!isTaskCommand) return res.sendStatus(200);
   }
 
-  if (!isTaskCommand && !isMentioned) {
-    return res.sendStatus(200);
-  }
-
-  console.log("Task received:", text);
+  // Build channels: every message is a task (no keyword needed)
+  console.log(`Task received in #${ch.name} (${ch.repo}):`, text);
   res.sendStatus(200);
 
   try {
-    // Fetch recent channel history for context
     let contextBlock = "";
     try {
       const history = await slack.conversations.history({ channel: event.channel, limit: 20 });
       const recentMessages = (history.messages || [])
         .filter(m => !m.bot_id)
         .reverse()
-        .map(m => `${m.text}`)
+        .map(m => m.text)
         .join("\n");
       if (recentMessages) contextBlock = `\n\nRecent channel context:\n${recentMessages}`;
     } catch (_) {}
 
-    await slack.chat.postMessage({ channel: event.channel, text: `🤖 On it!...` });
-    await runClaudeAndPR(text + contextBlock, event.channel, text);
+    await slack.chat.postMessage({ channel: event.channel, text: `🤖 On it! (→ ${ch.repo})` });
+    await runClaudeAndPR(text + contextBlock, event.channel, text, ch.repo);
   } catch (err) {
     console.error(err);
     await slack.chat.postMessage({ channel: event.channel, text: `❌ Something went wrong: ${err.message}` });
@@ -256,5 +264,5 @@ app.post("/slack/events", async (req, res) => {
 
 app.listen(3000, async () => {
   console.log("🚀 MoonOS Autopilot running on port 3000");
-  await resolveChannelId();
+  await resolveChannelIds();
 });
