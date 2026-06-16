@@ -238,7 +238,9 @@ app.post("/slack/events", async (req, res) => {
     if (!isTaskCommand) return res.sendStatus(200);
   }
 
-  // Build channels: every message is a task (no keyword needed)
+  // Build channels: only trigger when bot is mentioned
+  if (!isMentioned) return res.sendStatus(200);
+
   console.log(`Task received in #${ch.name} (${ch.repo}):`, text);
   res.sendStatus(200);
 
