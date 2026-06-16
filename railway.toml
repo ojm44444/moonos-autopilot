@@ -1,5 +1,5 @@
 [build]
 nixPacks = true
 
-[build.nixPacksConfig]
-aptPackages = ["git"]
+[build.nixpacksPlan.phases.setup]
+nixPkgs = ["git"]
