@@ -1,0 +1,99 @@
+idk where to put this - const express = require("express");
+const bodyParser = require("body-parser");
+const { WebClient } = require("@slack/web-api");
+const { Octokit } = require("@octokit/rest");
+
+const app = express();
+app.use(bodyParser.json());
+
+// ENV VARS (you will set these later)
+const slack = new WebClient(process.env.SLACK_BOT_TOKEN);
+const octokit = new Octokit({ auth: process.env.GITHUB_TOKEN });
+
+const OWNER = process.env.GITHUB_OWNER;
+const REPO = process.env.GITHUB_REPO;
+
+// Slack event endpoint
+app.post("/slack/events", async (req, res) => {
+  // Slack verification challenge
+  if (req.body.challenge) {
+    return res.send(req.body.challenge);
+  }
+
+  const event = req.body.event;
+
+  // ignore bot messages
+  if (!event || !event.text || event.bot_id) {
+    return res.sendStatus(200);
+  }
+
+  const prompt = event.text;
+
+  console.log("📩 Task received:", prompt);
+
+  try {
+    // STEP 1: create branch
+    const baseRef = await octokit.git.getRef({
+      owner: OWNER,
+      repo: REPO,
+      ref: "heads/main",
+    });
+
+    const branch = `ai-${Date.now()}`;
+
+    await octokit.git.createRef({
+      owner: OWNER,
+      repo: REPO,
+      ref: `refs/heads/${branch}`,
+      sha: baseRef.data.object.sha,
+    });
+
+    // STEP 2: placeholder file (we add Claude next)
+    const fileContent = `
+/**
+ * AI TASK:
+ * ${prompt}
+ */
+
+console.log("AI will generate real code here next step");
+`;
+
+    await octokit.repos.createOrUpdateFileContents({
+      owner: OWNER,
+      repo: REPO,
+      path: `ai/${Date.now()}.js`,
+      message: prompt,
+      content: Buffer.from(fileContent).toString("base64"),
+      branch,
+    });
+
+    // STEP 3: create PR
+    const pr = await octokit.pulls.create({
+      owner: OWNER,
+      repo: REPO,
+      title: `🤖 AI: ${prompt}`,
+      head: branch,
+      base: "main",
+    });
+
+    // STEP 4: reply to Slack
+    await slack.chat.postMessage({
+      channel: event.channel,
+      text: `✅ PR created: ${pr.data.html_url}`,
+    });
+
+  } catch (err) {
+    console.error(err);
+
+    await slack.chat.postMessage({
+      channel: event.channel,
+      text: `❌ Error creating PR. Check logs.`,
+    });
+  }
+
+  res.sendStatus(200);
+});
+
+app.listen(3000, () => {
+  console.log("🚀 MoonOS Autopilot running on port 3000");
+})
