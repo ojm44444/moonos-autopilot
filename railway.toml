@@ -1,0 +1,5 @@
+[build]
+nixPacks = true
+
+[build.nixPacksConfig]
+aptPackages = ["git"]
