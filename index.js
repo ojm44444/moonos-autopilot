@@ -210,25 +210,23 @@ app.post("/slack/events", async (req, res) => {
   const text = event.text;
   const textLower = text.toLowerCase();
 
-  if (isErrorChannel) {
-    if (textLower.trim() === "triage") {
-      console.log("Triage requested");
-      res.sendStatus(200);
-      try {
-        await triageErrors(event.channel);
-      } catch (err) {
-        console.error(err);
-        await slack.chat.postMessage({ channel: event.channel, text: `❌ Triage failed: ${err.message}` });
-      }
-    } else {
-      // Just log it, don't auto-fix every message
-      console.log("Error logged:", text.substring(0, 100));
-      res.sendStatus(200);
+  const isMentioned = text.includes("<@") && event.text.includes("MoonOS Builder") || textLower.includes("@moonos builder");
+  const isTriageCommand = textLower.trim() === "triage";
+  const isTaskCommand = textLower.startsWith("build") || textLower.startsWith("fix") || textLower.startsWith("add") || textLower.startsWith("create");
+
+  if (isErrorChannel && isTriageCommand) {
+    console.log("Triage requested");
+    res.sendStatus(200);
+    try {
+      await triageErrors(event.channel);
+    } catch (err) {
+      console.error(err);
+      await slack.chat.postMessage({ channel: event.channel, text: `❌ Triage failed: ${err.message}` });
     }
     return;
   }
 
-  if (!textLower.startsWith("build") && !textLower.startsWith("fix") && !textLower.startsWith("add") && !textLower.startsWith("create")) {
+  if (!isTaskCommand && !isMentioned) {
     return res.sendStatus(200);
   }
 
