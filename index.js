@@ -23,6 +23,7 @@ const octokit = new Octokit({ auth: GITHUB_TOKEN });
 const anthropic = new Anthropic({ apiKey: ANTHROPIC_API_KEY });
 
 let errorChannelId = null;
+let lastTriageTs = null; // timestamp of last triage run
 
 async function resolveChannelId() {
   const result = await slack.conversations.list({ limit: 200 });
@@ -141,6 +142,64 @@ async function runClaudeAndPR(taskDescription, channel, label) {
   await slack.chat.postMessage({ channel, text: `✅ Done! Code merged and deploying:\n${pr.data.html_url}` });
 }
 
+async function triageErrors(channel) {
+  // Fetch messages from channel — all if first run, else since last triage
+  const params = { channel, limit: 200 };
+  if (lastTriageTs) params.oldest = lastTriageTs;
+
+  const result = await slack.conversations.history(params);
+  const messages = result.messages || [];
+
+  // Filter out bot messages and triage commands
+  const errors = messages
+    .filter(m => !m.bot_id && !m.text.toLowerCase().startsWith("triage"))
+    .map(m => m.text)
+    .filter(t => t && t.trim().length > 10)
+    .reverse(); // oldest first
+
+  if (errors.length === 0) {
+    await slack.chat.postMessage({ channel, text: `✅ No new errors since last triage!` });
+    return;
+  }
+
+  await slack.chat.postMessage({ channel, text: `🔍 Found ${errors.length} error(s) — analysing and triaging...` });
+
+  // Ask Claude to triage
+  const triageMessage = await anthropic.messages.create({
+    model: "claude-sonnet-4-6",
+    max_tokens: 2048,
+    messages: [{
+      role: "user",
+      content: `You are triaging errors for the moon-dashboard app. Here are the errors reported:\n\n${errors.map((e, i) => `${i + 1}. ${e}`).join("\n\n")}\n\nPlease:\n1. Remove duplicates\n2. Rank by severity (Critical / High / Medium / Low)\n3. Give a one-line summary of each unique issue\n4. List which ones you will fix (top 3 max)\n\nFormat as a clean Slack message.`
+    }]
+  });
+
+  const summary = triageMessage.content[0].text;
+  await slack.chat.postMessage({ channel, text: summary });
+
+  // Fix top 3 unique errors
+  const fixMessage = await anthropic.messages.create({
+    model: "claude-sonnet-4-6",
+    max_tokens: 1024,
+    messages: [{
+      role: "user",
+      content: `From these errors in the moon-dashboard app:\n\n${errors.join("\n\n")}\n\nList the top 3 most important unique issues to fix, one per line. Just the issue description, nothing else.`
+    }]
+  });
+
+  const toFix = fixMessage.content[0].text.split("\n").filter(l => l.trim()).slice(0, 3);
+  lastTriageTs = String(Date.now() / 1000);
+
+  for (const issue of toFix) {
+    await slack.chat.postMessage({ channel, text: `🔧 Fixing: ${issue}` });
+    try {
+      await runClaudeAndPR(issue, channel, issue);
+    } catch (err) {
+      await slack.chat.postMessage({ channel, text: `❌ Could not fix: ${err.message}` });
+    }
+  }
+}
+
 app.post("/slack/events", async (req, res) => {
   if (req.body.challenge) return res.send(req.body.challenge);
 
@@ -152,15 +211,19 @@ app.post("/slack/events", async (req, res) => {
   const textLower = text.toLowerCase();
 
   if (isErrorChannel) {
-    console.log("Error received:", text.substring(0, 100));
-    res.sendStatus(200);
-    try {
-      await slack.chat.postMessage({ channel: event.channel, text: `🔍 Error detected — running Claude to fix it...` });
-      const prompt = `An error was reported in the moon-dashboard app:\n\n${text}\n\nInvestigate the relevant files and fix the root cause. Make the minimal change needed.`;
-      await runClaudeAndPR(prompt, event.channel, text);
-    } catch (err) {
-      console.error(err);
-      await slack.chat.postMessage({ channel: event.channel, text: `❌ Could not auto-fix: ${err.message}` });
+    if (textLower.trim() === "triage") {
+      console.log("Triage requested");
+      res.sendStatus(200);
+      try {
+        await triageErrors(event.channel);
+      } catch (err) {
+        console.error(err);
+        await slack.chat.postMessage({ channel: event.channel, text: `❌ Triage failed: ${err.message}` });
+      }
+    } else {
+      // Just log it, don't auto-fix every message
+      console.log("Error logged:", text.substring(0, 100));
+      res.sendStatus(200);
     }
     return;
   }
