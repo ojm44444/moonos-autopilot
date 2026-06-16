@@ -234,8 +234,20 @@ app.post("/slack/events", async (req, res) => {
   res.sendStatus(200);
 
   try {
-    await slack.chat.postMessage({ channel: event.channel, text: `🤖 On it! Running Claude on: "${text}"...` });
-    await runClaudeAndPR(text, event.channel, text);
+    // Fetch recent channel history for context
+    let contextBlock = "";
+    try {
+      const history = await slack.conversations.history({ channel: event.channel, limit: 20 });
+      const recentMessages = (history.messages || [])
+        .filter(m => !m.bot_id)
+        .reverse()
+        .map(m => `${m.text}`)
+        .join("\n");
+      if (recentMessages) contextBlock = `\n\nRecent channel context:\n${recentMessages}`;
+    } catch (_) {}
+
+    await slack.chat.postMessage({ channel: event.channel, text: `🤖 On it!...` });
+    await runClaudeAndPR(text + contextBlock, event.channel, text);
   } catch (err) {
     console.error(err);
     await slack.chat.postMessage({ channel: event.channel, text: `❌ Something went wrong: ${err.message}` });
