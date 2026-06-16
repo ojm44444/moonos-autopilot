@@ -3,10 +3,8 @@ const bodyParser = require("body-parser");
 const { WebClient } = require("@slack/web-api");
 const { Octokit } = require("@octokit/rest");
 const Anthropic = require("@anthropic-ai/sdk");
-const { execSync } = require("child_process");
 const fs = require("fs");
 const path = require("path");
-const os = require("os");
 
 require("dotenv").config();
 
@@ -37,103 +35,103 @@ async function resolveChannelId() {
   }
 }
 
-function getRepoFiles(dir, baseDir = dir, fileList = []) {
-  const ignore = ["node_modules", ".git", ".next", "dist", "build", ".env"];
-  const entries = fs.readdirSync(dir, { withFileTypes: true });
-  for (const entry of entries) {
-    if (ignore.includes(entry.name)) continue;
-    const fullPath = path.join(dir, entry.name);
-    if (entry.isDirectory()) {
-      getRepoFiles(fullPath, baseDir, fileList);
-    } else {
-      const ext = path.extname(entry.name);
-      if ([".js", ".jsx", ".ts", ".tsx", ".css", ".json", ".md"].includes(ext)) {
-        fileList.push(path.relative(baseDir, fullPath));
+async function getRepoFiles() {
+  const ignore = ["node_modules", ".git", ".next", "dist", "build"];
+  const extensions = [".js", ".jsx", ".ts", ".tsx", ".css", ".json", ".md"];
+  const files = [];
+
+  async function listDir(dirPath) {
+    const { data } = await octokit.repos.getContent({ owner: OWNER, repo: REPO, path: dirPath });
+    for (const item of data) {
+      if (ignore.some(ig => item.name === ig)) continue;
+      if (item.type === "dir") {
+        await listDir(item.path);
+      } else if (extensions.includes(path.extname(item.name))) {
+        files.push(item.path);
       }
     }
   }
-  return fileList;
+
+  await listDir("");
+  return files.slice(0, 25);
+}
+
+async function getFileContent(filePath) {
+  try {
+    const { data } = await octokit.repos.getContent({ owner: OWNER, repo: REPO, path: filePath });
+    return Buffer.from(data.content, "base64").toString("utf8").slice(0, 2000);
+  } catch (_) {
+    return "";
+  }
 }
 
 async function runClaudeAndPR(taskDescription, channel, label) {
   const branch = `ai-${Date.now()}`;
-  const repoPath = path.join(os.tmpdir(), `moon-dashboard-${Date.now()}`);
 
-  try {
-    // Clone the repo fresh into /tmp
-    console.log("Cloning repo...");
-    execSync(
-      `git clone https://${GITHUB_TOKEN}@github.com/${OWNER}/${REPO}.git ${repoPath}`,
-      { stdio: "inherit" }
-    );
-    execSync(`git -C ${repoPath} config user.email "ojm221100@gmail.com"`, { stdio: "inherit" });
-    execSync(`git -C ${repoPath} config user.name "MoonOS Autopilot"`, { stdio: "inherit" });
-    execSync(`git -C ${repoPath} checkout -b ${branch}`, { stdio: "inherit" });
+  // Get main branch SHA
+  const { data: refData } = await octokit.git.getRef({ owner: OWNER, repo: REPO, ref: "heads/main" });
+  const mainSha = refData.object.sha;
 
-    // Build context from repo files
-    const files = getRepoFiles(repoPath);
-    let repoContext = "";
-    for (const file of files.slice(0, 30)) {
-      try {
-        const content = fs.readFileSync(path.join(repoPath, file), "utf8");
-        repoContext += `\n\n--- ${file} ---\n${content.slice(0, 2000)}`;
-      } catch (_) {}
-    }
+  // Create new branch
+  await octokit.git.createRef({ owner: OWNER, repo: REPO, ref: `refs/heads/${branch}`, sha: mainSha });
 
-    console.log("Calling Claude API...");
-    const message = await anthropic.messages.create({
-      model: "claude-sonnet-4-6",
-      max_tokens: 4096,
-      messages: [{
-        role: "user",
-        content: `You are working on the moon-dashboard Next.js app. Here are the current files:\n${repoContext}\n\nTask: ${taskDescription}\n\nRespond with ONLY the files to create or modify. For each file use this exact format:\n\n<file path="relative/path/to/file.tsx">\nfile contents here\n</file>\n\nDo not explain, just output the file blocks.`
-      }]
-    });
-
-    const responseText = message.content[0].text;
-    const fileMatches = [...responseText.matchAll(/<file path="([^"]+)">([\s\S]*?)<\/file>/g)];
-
-    if (fileMatches.length === 0) {
-      await slack.chat.postMessage({ channel, text: `⚠️ Claude didn't produce any file changes for: "${label}"` });
-      return;
-    }
-
-    for (const [, filePath, fileContent] of fileMatches) {
-      const fullPath = path.join(repoPath, filePath);
-      fs.mkdirSync(path.dirname(fullPath), { recursive: true });
-      fs.writeFileSync(fullPath, fileContent.trim());
-      console.log(`✅ Wrote ${filePath}`);
-    }
-
-    execSync(`git -C ${repoPath} add -A`, { stdio: "inherit" });
-
-    let hasChanges = true;
-    try {
-      execSync(`git -C ${repoPath} diff --cached --exit-code`, { stdio: "inherit" });
-      hasChanges = false;
-    } catch (e) {}
-
-    if (!hasChanges) {
-      await slack.chat.postMessage({ channel, text: `⚠️ Claude ran but made no file changes for: "${label}"` });
-      return;
-    }
-
-    execSync(`git -C ${repoPath} commit -m "AI: ${label.substring(0, 60)}"`, { stdio: "inherit" });
-    execSync(`git -C ${repoPath} push https://${GITHUB_TOKEN}@github.com/${OWNER}/${REPO}.git ${branch}`, { stdio: "inherit" });
-
-    const pr = await octokit.pulls.create({
-      owner: OWNER, repo: REPO,
-      title: `AI: ${label.substring(0, 60)}`,
-      head: branch, base: "main",
-      body: `Automated change from Slack.\n\nTask:\n> ${label}`,
-    });
-
-    await slack.chat.postMessage({ channel, text: `✅ PR ready for review:\n${pr.data.html_url}` });
-
-  } finally {
-    // Clean up temp folder
-    try { execSync(`rm -rf ${repoPath}`); } catch (_) {}
+  // Get repo context
+  const filePaths = await getRepoFiles();
+  let repoContext = "";
+  for (const fp of filePaths) {
+    const content = await getFileContent(fp);
+    if (content) repoContext += `\n\n--- ${fp} ---\n${content}`;
   }
+
+  console.log("Calling Claude API...");
+  const message = await anthropic.messages.create({
+    model: "claude-sonnet-4-6",
+    max_tokens: 4096,
+    messages: [{
+      role: "user",
+      content: `You are working on the moon-dashboard Next.js app. Here are the current files:\n${repoContext}\n\nTask: ${taskDescription}\n\nRespond with ONLY the files to create or modify. For each file use this exact format:\n\n<file path="relative/path/to/file.tsx">\nfile contents here\n</file>\n\nDo not explain, just output the file blocks.`
+    }]
+  });
+
+  const responseText = message.content[0].text;
+  const fileMatches = [...responseText.matchAll(/<file path="([^"]+)">([\s\S]*?)<\/file>/g)];
+
+  if (fileMatches.length === 0) {
+    await slack.chat.postMessage({ channel, text: `⚠️ Claude didn't produce any file changes for: "${label}"` });
+    return;
+  }
+
+  // Commit each file via GitHub API
+  for (const [, filePath, fileContent] of fileMatches) {
+    const content = fileContent.trim();
+    const encoded = Buffer.from(content).toString("base64");
+
+    // Check if file exists (to get SHA for update)
+    let fileSha;
+    try {
+      const { data } = await octokit.repos.getContent({ owner: OWNER, repo: REPO, path: filePath, ref: branch });
+      fileSha = data.sha;
+    } catch (_) {}
+
+    await octokit.repos.createOrUpdateFileContents({
+      owner: OWNER, repo: REPO,
+      path: filePath,
+      message: `AI: ${label.substring(0, 60)}`,
+      content: encoded,
+      branch,
+      ...(fileSha ? { sha: fileSha } : {}),
+    });
+    console.log(`✅ Committed ${filePath}`);
+  }
+
+  const pr = await octokit.pulls.create({
+    owner: OWNER, repo: REPO,
+    title: `AI: ${label.substring(0, 60)}`,
+    head: branch, base: "main",
+    body: `Automated change from Slack.\n\nTask:\n> ${label}`,
+  });
+
+  await slack.chat.postMessage({ channel, text: `✅ PR ready for review:\n${pr.data.html_url}` });
 }
 
 app.post("/slack/events", async (req, res) => {
