@@ -131,7 +131,14 @@ async function runClaudeAndPR(taskDescription, channel, label) {
     body: `Automated change from Slack.\n\nTask:\n> ${label}`,
   });
 
-  await slack.chat.postMessage({ channel, text: `✅ PR ready for review:\n${pr.data.html_url}` });
+  // Auto-merge the PR
+  await octokit.pulls.merge({
+    owner: OWNER, repo: REPO,
+    pull_number: pr.data.number,
+    merge_method: "squash",
+  });
+
+  await slack.chat.postMessage({ channel, text: `✅ Done! Code merged and deploying:\n${pr.data.html_url}` });
 }
 
 app.post("/slack/events", async (req, res) => {
