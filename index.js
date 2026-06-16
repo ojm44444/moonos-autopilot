@@ -210,7 +210,7 @@ app.post("/slack/events", async (req, res) => {
   const text = event.text;
   const textLower = text.toLowerCase();
 
-  const isMentioned = text.includes("<@") && event.text.includes("MoonOS Builder") || textLower.includes("@moonos builder");
+  const isMentioned = text.includes("<@U0BB2LN6AKB>");
   const isTriageCommand = textLower.trim() === "triage";
   const isTaskCommand = textLower.startsWith("build") || textLower.startsWith("fix") || textLower.startsWith("add") || textLower.startsWith("create");
 
