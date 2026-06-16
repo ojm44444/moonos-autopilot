@@ -14,6 +14,9 @@ app.use(bodyParser.json());
 const SLACK_BOT_TOKEN = process.env.SLACK_BOT_TOKEN;
 const GITHUB_TOKEN = process.env.GITHUB_TOKEN;
 const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY;
+const VERCEL_TOKEN = process.env.VERCEL_TOKEN;
+const VERCEL_TEAM_ID = "team_kjGSCHKE5dayGG6MmiEwxA0C";
+const VERCEL_PROJECT_ID = "prj_VNZPSBBatjdDFD5UgH71zRgOu4K3";
 const OWNER = "ojm44444";
 
 const CHANNELS = {
@@ -136,13 +139,124 @@ async function runClaudeAndPR(taskDescription, channel, label, repo = "moon-dash
   });
 
   // Auto-merge the PR
-  await octokit.pulls.merge({
+  const mergeResult = await octokit.pulls.merge({
     owner: OWNER, repo,
     pull_number: pr.data.number,
     merge_method: "squash",
   });
+  const mergeCommitSha = mergeResult.data.sha;
 
-  await slack.chat.postMessage({ channel, text: `✅ Done! Code merged and deploying:\n${pr.data.html_url}` });
+  await slack.chat.postMessage({ channel, text: `🔀 PR merged — waiting for Vercel deploy...\n${pr.data.html_url}` });
+
+  // Only watch Vercel for moon-dashboard (memo may not be on Vercel)
+  if (repo === "moon-dashboard" && VERCEL_TOKEN) {
+    watchVercelDeploy(channel, mergeCommitSha, pr.data.html_url).catch(console.error);
+  }
+}
+
+async function watchVercelDeploy(channel, commitSha, prUrl) {
+  // Wait for Vercel to pick up the commit
+  await new Promise(r => setTimeout(r, 15000));
+
+  const maxAttempts = 24; // 24 * 15s = 6 minutes
+  let deploymentId = null;
+
+  for (let i = 0; i < maxAttempts; i++) {
+    await new Promise(r => setTimeout(r, 15000));
+
+    try {
+      const resp = await fetch(
+        `https://api.vercel.com/v6/deployments?projectId=${VERCEL_PROJECT_ID}&teamId=${VERCEL_TEAM_ID}&limit=5`,
+        { headers: { Authorization: `Bearer ${VERCEL_TOKEN}` } }
+      );
+      const data = await resp.json();
+      const deployments = data.deployments || [];
+
+      // Find the deployment matching our commit
+      const match = deployments.find(d =>
+        d.meta?.githubCommitSha === commitSha || d.target === "production"
+      );
+
+      if (!match) continue;
+      deploymentId = match.uid || match.id;
+
+      if (match.state === "READY") {
+        await slack.chat.postMessage({
+          channel,
+          text: `✅ Deployed successfully! Live now.\n${prUrl}`,
+        });
+        return;
+      }
+
+      if (match.state === "ERROR" || match.state === "CANCELED") {
+        // Fetch build logs
+        let logSnippet = "";
+        try {
+          const logResp = await fetch(
+            `https://api.vercel.com/v2/deployments/${deploymentId}/events?teamId=${VERCEL_TEAM_ID}&limit=50`,
+            { headers: { Authorization: `Bearer ${VERCEL_TOKEN}` } }
+          );
+          const events = await logResp.json();
+          const errors = (Array.isArray(events) ? events : [])
+            .filter(e => e.type === "stderr" || (e.payload?.text && /error/i.test(e.payload.text)))
+            .slice(-10)
+            .map(e => e.payload?.text || e.text || "")
+            .filter(Boolean)
+            .join("\n");
+          if (errors) logSnippet = `\n\nBuild errors:\n\`\`\`\n${errors.slice(0, 800)}\n\`\`\``;
+        } catch (_) {}
+
+        await slack.chat.postMessage({
+          channel,
+          text: `❌ Deploy FAILED — reverting the merge now.${logSnippet}\n${prUrl}`,
+        });
+
+        // Revert by creating a revert commit
+        try {
+          const { data: mainRef } = await octokit.git.getRef({ owner: OWNER, repo: "moon-dashboard", ref: "heads/main" });
+          const currentSha = mainRef.object.sha;
+          const { data: currentCommit } = await octokit.git.getCommit({ owner: OWNER, repo: "moon-dashboard", commit_sha: currentSha });
+          const parentSha = currentCommit.parents[0]?.sha;
+
+          if (parentSha) {
+            const revertBranch = `revert-${Date.now()}`;
+            await octokit.git.createRef({ owner: OWNER, repo: "moon-dashboard", ref: `refs/heads/${revertBranch}`, sha: parentSha });
+            const revertPr = await octokit.pulls.create({
+              owner: OWNER, repo: "moon-dashboard",
+              title: `Revert: failed deploy`,
+              head: revertBranch, base: "main",
+              body: `Auto-revert of ${prUrl} which caused a Vercel build failure.`,
+            });
+            await octokit.pulls.merge({
+              owner: OWNER, repo: "moon-dashboard",
+              pull_number: revertPr.data.number,
+              merge_method: "merge",
+            });
+            await slack.chat.postMessage({
+              channel,
+              text: `↩️ Reverted. Main branch is back to the previous state.\n${revertPr.data.html_url}`,
+            });
+          }
+        } catch (revertErr) {
+          await slack.chat.postMessage({
+            channel,
+            text: `⚠️ Could not auto-revert: ${revertErr.message} — please check manually.`,
+          });
+        }
+        return;
+      }
+
+      // Still building — keep polling
+      console.log(`Vercel deploy ${deploymentId} state: ${match.state} (attempt ${i + 1})`);
+    } catch (err) {
+      console.error("Vercel poll error:", err.message);
+    }
+  }
+
+  await slack.chat.postMessage({
+    channel,
+    text: `⏱️ Deploy is taking longer than expected — check Vercel manually.\n${prUrl}`,
+  });
 }
 
 async function triageErrors(channel) {
